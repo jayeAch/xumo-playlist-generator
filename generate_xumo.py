@@ -11,6 +11,7 @@ import re
 import uuid # Needed for IFA placeholder
 import sys
 import math # For calculating total pages
+import concurrent.futures
 
 # --- Configuration ---
 ANDROID_TV_ENDPOINT = "https://android-tv-mds.xumo.com/v2" # Keep for asset/broadcast lookups
@@ -40,7 +41,7 @@ XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id
 
 # --- Script Settings ---
 EPG_FETCH_DAYS = 2
-MAX_EPG_OFFSET = 350
+MAX_EPG_OFFSET = 1000  # 436 channels need offset 400; old limit of 350 skipped the last page
 HOURS_TO_FETCH = 24  # retained for backwards compat; no longer used by EPG fetch
 API_DELAY_SECONDS = 0.10
 OUTPUT_DIR = "playlists"
@@ -289,95 +290,114 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
 # <<< END OF FUNCTION ADDED BACK >>>
 
 
-def fetch_epg_data(channel_list):
-    """Fetches EPG data using the Valencia endpoint, one request per date with offset pagination.
+def extract_assets(page_data):
+    """Returns {assetId: details} from an EPG page, whether 'assets' is a dict keyed by id or a list."""
+    assets = page_data.get('assets')
+    if isinstance(assets, dict):
+        return assets
+    if isinstance(assets, list):
+        out = {}
+        for a in assets:
+            if isinstance(a, dict):
+                aid = a.get('id') or a.get('assetId')
+                if aid: out[str(aid)] = a
+        return out
+    return {}
 
-    Confirmed working URL shape (candidate B, tested 2026-10-25):
-        /v2/epg/10006/{YYYYMMDD}/0.json?limit=50&offset={N}
-    Hour is fixed at 0; the server returns the day's schedule for that list.
-    Do NOT add &f=asset.title&f=asset.descriptions — those params caused HTTP 400.
+
+ASSET_INFO_URL_TEMPLATES = [
+    f"{ANDROID_TV_ENDPOINT}/assets/asset/{{asset_id}}.json?f=title&f=descriptions",
+    f"{VALENCIA_API_ENDPOINT}/assets/asset/{{asset_id}}.json?f=title&f=descriptions",
+]
+ASSET_INFO_WORKERS = 8
+
+
+def fetch_asset_info(asset_id):
+    """Fetches title/descriptions for one asset id, trying each endpoint in turn. Returns dict or None."""
+    for tmpl, headers in zip(ASSET_INFO_URL_TEMPLATES, (ANDROID_TV_HEADERS, WEB_HEADERS)):
+        data = fetch_data(tmpl.format(asset_id=asset_id), is_json=True, retries=0, delay=0, headers=headers)
+        if isinstance(data, dict) and data.get('title'):
+            return data
+    return None
+
+
+def fetch_epg_data(channel_list):
+    """Fetches EPG data from the Valencia endpoint (one request per date, offset pagination).
+
+    URL shape: /v2/epg/10006/{YYYYMMDD}/0.json?limit=50&offset={N}
+    That response lists the schedule (channelId, assetId, start, end) but does NOT reliably
+    include asset titles, so any assetId missing from the page's 'assets' is looked up
+    individually (cached, concurrent) via the asset endpoint.
     """
     if not channel_list: return {}
     logging.info(f"Fetching EPG data for {len(channel_list)} channels (using Valencia EPG endpoint {PRIMARY_LIST_ID})...")
-    consolidated_epg = {channel['id']: [] for channel in channel_list}; assets_cache = {}
     channel_ids_in_final_list = {ch['id'] for ch in channel_list}
+    assets_cache = {}
+    schedule_rows = []  # (channel_id, start, end, assetId)
     today = datetime.now(timezone.utc); dates_to_fetch = [today + timedelta(days=d) for d in range(EPG_FETCH_DAYS)]
-    total_requests = 0; total_programs_fetched = 0; total_programs_added = 0
+    total_requests = 0; logged_shape = False
 
+    # Pass 1: pull every page, collect schedule rows and whatever asset details the pages carry.
     for date_obj in dates_to_fetch:
         date_str = date_obj.strftime('%Y%m%d'); logging.info(f"Fetching EPG for date: {date_str}")
         offset = 0
         while offset <= MAX_EPG_OFFSET:
             total_requests += 1
             fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, offset=offset)
-            logging.debug(f"  Fetching EPG - Date={date_str}, Offset={offset} -> {fetch_url}")
-
-            # retries=0: a 400 here is deterministic (bad URL shape), retrying wastes ~12s each.
             page_data = fetch_data(fetch_url, is_json=True, retries=0, delay=0, headers=WEB_HEADERS)
-
             if not page_data or not isinstance(page_data, dict):
                 logging.warning(f"EPG page failed or empty for date={date_str}, offset={offset}. Stopping pagination for this date.")
                 break
-
-            if 'assets' in page_data and isinstance(page_data['assets'], dict):
-                assets_cache.update(page_data['assets'])
+            if not logged_shape:
+                logged_shape = True
+                logging.info(f"EPG page keys: {list(page_data.keys())}; 'assets' type: {type(page_data.get('assets')).__name__}")
+            assets_cache.update(extract_assets(page_data))
 
             channels_on_page = page_data.get('channels', [])
             if not isinstance(channels_on_page, list) or not channels_on_page:
-                logging.debug(f"No channels in page (date={date_str}, offset={offset}) — end of data for this date.")
                 break
-
-            for channel_schedule_data in channels_on_page:
-                channel_id = str(channel_schedule_data.get('channelId'))
-                if channel_id not in channel_ids_in_final_list:
-                    continue
-                if channel_id not in consolidated_epg:
-                    consolidated_epg[channel_id] = []
-                for program_schedule in channel_schedule_data.get('schedule', []):
-                    total_programs_fetched += 1
-                    asset_id = program_schedule.get('assetId')
-                    asset_details = assets_cache.get(asset_id)
-                    if not asset_details:
-                        logging.warning(f"EPG: Asset details not found for assetId {asset_id} on channel {channel_id} (Date={date_str}, Offset={offset})")
-                        continue
-                    start = program_schedule.get('start')
-                    end = program_schedule.get('end')
-                    if not start or not end:
-                        logging.warning(f"EPG: Program for asset {asset_id} on channel {channel_id} missing start/end time in schedule.")
-                        continue
-                    consolidated_epg[channel_id].append({
-                        'start': start,
-                        'end': end,
-                        'assetId': asset_id,
-                        'title': asset_details.get('title', 'Unknown Program'),
-                        'descriptions': asset_details.get('descriptions', {}),
-                        'episodeTitle': asset_details.get('episodeTitle'),
-                    })
-                    total_programs_added += 1
-
-            # End-of-data heuristic: fewer items than the limit means the server has no more.
-            if len(channels_on_page) < 50:
-                logging.debug(f"Page returned {len(channels_on_page)} channels (< limit 50) — treating as last page for date {date_str}.")
-                break
-
+            for cs in channels_on_page:
+                channel_id = str(cs.get('channelId'))
+                if channel_id not in channel_ids_in_final_list: continue
+                for ps in cs.get('schedule', []):
+                    asset_id = ps.get('assetId'); start = ps.get('start'); end = ps.get('end')
+                    if not asset_id or not start or not end: continue
+                    schedule_rows.append((channel_id, start, end, asset_id))
+            if len(channels_on_page) < 50: break
             offset += 50
             time.sleep(API_DELAY_SECONDS)
+    logging.info(f"Finished fetching EPG pages after {total_requests} requests; {len(schedule_rows)} schedule rows, {len(assets_cache)} assets in pages.")
 
-    logging.info(f"Finished fetching EPG data after {total_requests} requests.")
-    logging.info(f"Found {total_programs_fetched} raw program entries, successfully stored {total_programs_added} entries.")
-    logging.info("Removing duplicate program entries...")
-    final_epg = {}; duplicates_removed_total = 0
-    for channel_id, programs in consolidated_epg.items():
-        seen_programs = set(); unique_programs = []; duplicates_this_channel = 0
-        for prog in programs:
-            prog_key = (prog.get('start'), prog.get('assetId'))
-            if prog_key not in seen_programs: seen_programs.add(prog_key); unique_programs.append(prog)
-            else: duplicates_this_channel += 1
-        final_epg[channel_id] = unique_programs
-        if duplicates_this_channel > 0: logging.debug(f"  Channel {channel_id}: Removed {duplicates_this_channel} duplicates. Final count: {len(unique_programs)}")
-        duplicates_removed_total += duplicates_this_channel
-    logging.info(f"Finished EPG processing. Total duplicates removed: {duplicates_removed_total}")
-    return final_epg
+    # Pass 2: look up any asset the pages did not include.
+    missing = sorted({r[3] for r in schedule_rows if r[3] not in assets_cache})
+    if missing:
+        logging.info(f"Looking up {len(missing)} asset titles individually ({ASSET_INFO_WORKERS} workers)...")
+        found = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_INFO_WORKERS) as pool:
+            for aid, info in zip(missing, pool.map(fetch_asset_info, missing)):
+                if info:
+                    assets_cache[aid] = info; found += 1
+        logging.info(f"Asset lookup resolved {found}/{len(missing)} titles.")
+
+    # Pass 3: build per-channel programme lists (deduplicated).
+    consolidated_epg = {ch['id']: [] for ch in channel_list}
+    seen = set(); stored = 0; skipped = 0
+    for channel_id, start, end, asset_id in schedule_rows:
+        key = (channel_id, start, asset_id)
+        if key in seen: continue
+        seen.add(key)
+        details = assets_cache.get(asset_id)
+        if not details or not details.get('title'):
+            skipped += 1; continue
+        consolidated_epg[channel_id].append({
+            'start': start, 'end': end, 'assetId': asset_id,
+            'title': details.get('title', 'Unknown Program'),
+            'descriptions': details.get('descriptions', {}) or {},
+            'episodeTitle': details.get('episodeTitle'),
+        })
+        stored += 1
+    logging.info(f"Found {len(schedule_rows)} raw program entries, successfully stored {stored} entries ({skipped} skipped: no title).")
+    return consolidated_epg
 
 # --- Generate M3U and EPG XML ---
 
