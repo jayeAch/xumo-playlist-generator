@@ -26,10 +26,11 @@ BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channe
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
 # --- EPG Settings ---
-EPG_FETCH_DAYS = 3  # Yesterday, Today, Tomorrow, +2 Days
-# The trailing path segment of the EPG URL is a time block, NOT a constant.
-# "0" only returns ~00:00-06:00 UTC, which caused the 17-18h gaps.
-EPG_HOUR_BLOCKS = [0, 6, 12, 18]
+EPG_FETCH_DAYS = 1  # Yesterday, Today, Tomorrow, +2 Days
+# The trailing path segment of the EPG URL selects a slice of the day.
+# "0" alone only returns ~00:00-06:00 UTC (17-18h gaps). Valid values are
+# discovered at runtime by probing (see discover_epg_blocks) because 6/12/18 return HTTP 400.
+EPG_PROBE_RANGE = range(0, 24)
 EPG_PAGE_LIMIT = 50
 EPG_MAX_PAGES = 50  # Safety cap per date
 # FIX: Add f=asset.title and f=asset.descriptions so EPG returns program titles/descriptions inline
@@ -410,6 +411,23 @@ def _extract_inline_asset_info(schedule_item):
     return title, descriptions, episode_title
 
 
+def discover_epg_blocks(date_str):
+    """Probe which trailing path values the EPG endpoint accepts (HTTP 200 + channels)."""
+    valid = []
+    for b in EPG_PROBE_RANGE:
+        url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, block=b, offset=0)
+        data = fetch_data(url, is_json=True, retries=0, delay=0, headers=WEB_HEADERS)
+        ok = isinstance(data, dict) and isinstance(data.get('channels'), list) and len(data['channels']) > 0
+        logging.info(f"EPG block probe: date={date_str} block={b} -> {'VALID' if ok else 'invalid'}")
+        if ok:
+            valid.append(b)
+        time.sleep(API_DELAY_SECONDS)
+    if not valid:
+        valid = [0]
+    logging.info(f"Valid EPG blocks: {valid}")
+    return valid
+
+
 def fetch_epg_data(channel_list):
     if not channel_list:
         return {}
@@ -422,9 +440,11 @@ def fetch_epg_data(channel_list):
     start_day = today - timedelta(days=1)
     dates_to_fetch = [start_day + timedelta(days=d) for d in range(EPG_FETCH_DAYS + 1)]
 
+    epg_blocks = discover_epg_blocks(dates_to_fetch[1].strftime('%Y%m%d'))  # today's date
+
     for date_obj in dates_to_fetch:
         date_str = date_obj.strftime('%Y%m%d')
-        for block in EPG_HOUR_BLOCKS:
+        for block in epg_blocks:
             logging.info(f"Fetching EPG for date: {date_str} block: {block}")
             offset = 0
             seen_channels = 0
