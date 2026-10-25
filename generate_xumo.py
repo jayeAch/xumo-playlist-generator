@@ -26,11 +26,11 @@ BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channe
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
 # --- EPG Settings ---
-EPG_FETCH_DAYS = 2  # Yesterday, Today, Tomorrow, +2 Days
+EPG_FETCH_DAYS = 3  # Yesterday, Today, Tomorrow, +2 Days
 # The trailing path segment of the EPG URL selects a slice of the day.
 # "0" alone only returns ~00:00-06:00 UTC (17-18h gaps). Valid values are
 # discovered at runtime by probing (see discover_epg_blocks) because 6/12/18 return HTTP 400.
-EPG_PROBE_RANGE = range(0, 24)
+EPG_PROBE_RANGE = range(0, 6)  # confirmed: 0-3 valid (6-hour slices), 4+ invalid
 EPG_PAGE_LIMIT = 50
 EPG_MAX_PAGES = 50  # Safety cap per date
 # FIX: Add f=asset.title and f=asset.descriptions so EPG returns program titles/descriptions inline
@@ -375,6 +375,7 @@ ASSET_INFO_URL_TEMPLATES = [
 ]
 ASSET_INFO_WORKERS = 16
 ASSET_INFO_TIMEOUT = 15
+ASSET_LOOKUP_BUDGET_SECONDS = 420  # stop title lookups after this; cache fills over later runs
 
 
 def fetch_asset_info(asset_id):
@@ -496,6 +497,17 @@ def fetch_epg_data(channel_list):
 
     logging.info(f"EPG pages done: {len(schedule_rows)} total schedule rows collected.")
 
+    # Drop programmes that have already ended: useless for a live guide and the
+    # bulk of the title lookups.
+    now_utc = datetime.now(timezone.utc)
+    kept_rows = []
+    for r in schedule_rows:
+        end_dt = parse_iso_datetime(r['end'])
+        if end_dt and end_dt >= now_utc:
+            kept_rows.append(r)
+    logging.info(f"Dropped {len(schedule_rows) - len(kept_rows)} already-ended rows; {len(kept_rows)} remain.")
+    schedule_rows = kept_rows
+
     # Diagnostics for EPG Coverage
     per_channel = Counter(r['channel_id'] for r in schedule_rows)
     channels_with_epg = sum(1 for cid in channel_ids_in_final_list if per_channel.get(cid, 0) > 0)
@@ -532,12 +544,16 @@ def fetch_epg_data(channel_list):
         d = assets_cache.get(aid)
         return isinstance(d, dict) and bool(d.get("title"))
 
-    missing = sorted({r['asset_id'] for r in schedule_rows if not has_title(r['asset_id'])})
+    first_start = {}
+    for r in sorted(schedule_rows, key=lambda r: r['start']):
+        first_start.setdefault(r['asset_id'], r['start'])
+    # soonest-airing first, so the current/next programmes always get titles
+    missing = [aid for aid, _ in sorted(first_start.items(), key=lambda kv: kv[1]) if not has_title(aid)]
 
     # FIX: raise lookup cap now that inline titles cover most rows
     if missing:
         lookup_limit = len(missing)
-        logging.info(f"Attempting to look up {lookup_limit} missing titles...")
+        logging.info(f"Attempting to look up {lookup_limit} missing titles (soonest first, {ASSET_LOOKUP_BUDGET_SECONDS}s budget)...")
 
         found = 0
         t0 = time.time()
@@ -545,7 +561,7 @@ def fetch_epg_data(channel_list):
         futures = {pool.submit(fetch_asset_info, aid): aid for aid in missing[:lookup_limit]}
 
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=900):
+            for fut in concurrent.futures.as_completed(futures, timeout=ASSET_LOOKUP_BUDGET_SECONDS):
                 try:
                     info = fut.result()
                 except Exception:
