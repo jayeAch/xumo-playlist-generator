@@ -11,6 +11,7 @@ import re
 import uuid
 import sys
 import concurrent.futures
+from collections import Counter
 
 # --- Configuration ---
 ANDROID_TV_ENDPOINT = "https://android-tv-mds.xumo.com/v2"
@@ -25,9 +26,9 @@ BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channe
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
 # --- EPG Settings ---
-EPG_FETCH_DAYS = 2
+EPG_FETCH_DAYS = 3  # Yesterday, Today, Tomorrow, +2 Days
 EPG_PAGE_LIMIT = 50
-EPG_MAX_PAGES = 40  # safety cap per date (454 channels / 50 ≈ 10 pages)
+EPG_MAX_PAGES = 50  # Safety cap per date
 EPG_FETCH_URL_TEMPLATE = f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/0.json?limit={EPG_PAGE_LIMIT}&offset={{offset}}"
 
 XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id}/168x168.png?type=color_onBlack"
@@ -67,7 +68,6 @@ logging.basicConfig(
 # --- Helpers ---
 
 def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_HEADERS, timeout=None):
-    """Fetches data from a URL, handles JSON parsing and errors, includes retries."""
     logging.debug(f"URL: {url}, Params: {params}")
     for attempt in range(retries + 1):
         response = None
@@ -78,7 +78,6 @@ def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_H
             response.raise_for_status()
             if is_json:
                 if not response.content:
-                    logging.warning(f"Empty response content received from {url}")
                     return None
                 try:
                     return response.json()
@@ -86,11 +85,7 @@ def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_H
                     logging.error(f"Error decoding JSON. Content: {response.text[:500]}... - {e_final}")
                     return None
             else:
-                try:
-                    return response.content.decode('utf-8', errors='ignore')
-                except Exception as decode_ex:
-                    logging.error(f"Error decoding text response: {decode_ex}")
-                    return None
+                return response.content.decode('utf-8', errors='ignore')
         except requests.exceptions.HTTPError as e:
             logging.warning(f"Attempt {attempt+1}/{retries+1} HTTP Error: {e}")
             if response is not None:
@@ -98,7 +93,6 @@ def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_H
             if attempt < retries and response is not None and response.status_code not in [401, 403, 404, 429]:
                 time.sleep(delay * (attempt + 1))
             elif attempt == retries:
-                logging.error(f"Final attempt failed with HTTP Error: {e}")
                 return None
             else:
                 break
@@ -107,22 +101,14 @@ def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_H
             if attempt < retries:
                 time.sleep(delay * (attempt + 1))
             elif attempt == retries:
-                logging.error(f"Final attempt failed with Network Error: {e}")
                 return None
     return None
 
 
 _TZ_TAIL_RE = re.compile(r'([+-])(\d{2})(\d{2})$')
 
-
 def parse_iso_datetime(iso_time_str):
-    """Parses ISO 8601 string, handling 'Z', milliseconds, and '+HHMM' timezone format.
-
-    Xumo returns timestamps like '2026-10-26T00:00:00+0000' (no colon in offset),
-    which Python's fromisoformat rejects before 3.11 — normalize first.
-    """
     if not iso_time_str:
-        logging.debug("Empty ISO time string; returning None")
         return None
     try:
         original_str = iso_time_str
@@ -143,7 +129,8 @@ def parse_iso_datetime(iso_time_str):
                 iso_time_str = iso_time_str[:offset_index]
             iso_time_str = iso_time_str.split('.', 1)[0]
             iso_time_str += offset_str
-        # Normalize "+HHMM"/"-HHMM" -> "+HH:MM" (required on Python <=3.10)
+        
+        # Normalize "+HHMM" to "+HH:MM" for Python <= 3.10 compatibility
         iso_time_str = _TZ_TAIL_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}:{m.group(3)}", iso_time_str)
         if '+' not in iso_time_str[10:] and '-' not in iso_time_str[10:]:
             iso_time_str += "+00:00"
@@ -155,9 +142,7 @@ def parse_iso_datetime(iso_time_str):
 
 
 def format_xmltv_time(dt_obj):
-    """Formats datetime object into XMLTV time (YYYYMMDDHHMMSS +HHMM)."""
     if not isinstance(dt_obj, datetime):
-        logging.warning(f"format_xmltv_time received non-datetime object: {type(dt_obj)}")
         return ""
     if not dt_obj.tzinfo:
         dt_obj_utc = dt_obj.replace(tzinfo=timezone.utc)
@@ -178,21 +163,15 @@ def ensure_output_dir():
             raise
 
 
-ADD_XMLTV_DOCTYPE = True
-
-
 def save_gzipped_xml(tree, filepath):
     try:
-        if ADD_XMLTV_DOCTYPE:
-            xml_partial_string = ET.tostring(tree.getroot(), encoding='unicode', method='xml')
-            xml_full_string = (
-                '<?xml version="1.0" encoding="UTF-8"?>\n'
-                '<!DOCTYPE tv SYSTEM "xmltv.dtd">\n'
-                f'{xml_partial_string}'
-            )
-            xml_bytes = xml_full_string.encode('utf-8')
-        else:
-            xml_bytes = ET.tostring(tree.getroot(), encoding='UTF-8', xml_declaration=True)
+        xml_partial_string = ET.tostring(tree.getroot(), encoding='unicode', method='xml')
+        xml_full_string = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE tv SYSTEM "xmltv.dtd">\n'
+            f'{xml_partial_string}'
+        )
+        xml_bytes = xml_full_string.encode('utf-8')
         with gzip.open(filepath, 'wb') as f:
             f.write(xml_bytes)
         logging.info(f"Gzipped EPG XML file saved: {filepath}")
@@ -252,10 +231,9 @@ def get_channels_via_primary_list():
     elif 'items' in data and isinstance(data['items'], list):
         channel_items = data['items']
     else:
-        logging.error(f"Could not find channel list in primary list response. Keys: {list(data.keys())}")
         return None
 
-    logging.info(f"Found {len(channel_items)} potential channel items in primary list response.")
+    logging.info(f"Found {len(channel_items)} potential channel items.")
     if not channel_items:
         return None
 
@@ -266,12 +244,9 @@ def get_channels_via_primary_list():
         is_live_raw = properties.get('is_live')
         is_live = is_live_raw is True or str(is_live_raw).lower() == "true"
         is_drm = callsign.endswith("-DRM") or callsign.endswith("DRM-CMS")
-        if is_drm:
-            logging.debug(f"Skipping DRM channel: {item.get('guid', {}).get('value')} ({item.get('title')})")
+        if is_drm or not is_live:
             continue
-        if not is_live:
-            logging.debug(f"Skipping non-live channel: {item.get('guid', {}).get('value')} ({item.get('title')})")
-            continue
+        
         try:
             channel_id = item.get('guid', {}).get('value')
             title = item.get('title')
@@ -285,7 +260,6 @@ def get_channels_via_primary_list():
                 genre = genre_list
 
             if not channel_id or not title:
-                logging.warning(f"Skipping item due to missing ID or title: {item}")
                 continue
 
             channel_id_str = str(channel_id)
@@ -310,18 +284,16 @@ def get_channels_via_primary_list():
                 'stream_url': None,
             })
         except Exception as e:
-            logging.warning(f"Error processing channel list item: {e}", exc_info=True)
+            pass
 
     if not processed_channels:
-        logging.warning("No channels could be processed from primary list.")
         return None
 
-    sample_ids = [c['id'] for c in processed_channels[:5]]
-    logging.info(f"Successfully processed {len(processed_channels)} channels. Sample IDs: {sample_ids}")
+    logging.info(f"Successfully processed {len(processed_channels)} live, non-DRM channels.")
     return processed_channels
 
 
-# --- Stream URLs via asset lookup ---
+# --- Stream URLs ---
 
 def fetch_stream_urls_via_asset_lookup(channels_list):
     logging.info(f"Attempting Android TV asset lookup for {len(channels_list)} channels...")
@@ -330,15 +302,12 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
 
     for i, channel_info in enumerate(channels_list):
         channel_id = channel_info['id']
-        logging.debug(f"Asset Lookup: {channel_id} ({channel_info['name']}) ({i+1}/{len(channels_list)})")
-
         current_hour = datetime.now(timezone.utc).hour
         broadcast_url = BROADCAST_NOW_URL_TEMPLATE.format(channel_id=channel_id, hour_num=current_hour)
         broadcast_data = fetch_data(broadcast_url, is_json=True, retries=1, headers=ANDROID_TV_HEADERS)
 
         asset_id = None
-        if broadcast_data and 'assets' in broadcast_data \
-                and isinstance(broadcast_data['assets'], list) and broadcast_data['assets']:
+        if broadcast_data and 'assets' in broadcast_data and broadcast_data['assets']:
             now_utc = datetime.now(timezone.utc)
             current_asset = None
             for asset in broadcast_data['assets']:
@@ -349,15 +318,9 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
                     break
             if not current_asset:
                 current_asset = broadcast_data['assets'][0]
-                logging.debug(f"No time-matched asset for {channel_id}; using first broadcast asset.")
             asset_id = current_asset.get('id')
-        else:
-            logging.warning(f"No broadcast data for channel {channel_id} (hour {current_hour})")
-            time.sleep(API_DELAY_SECONDS)
-            continue
 
         if not asset_id:
-            logging.warning(f"No asset ID for channel {channel_id}")
             time.sleep(API_DELAY_SECONDS)
             continue
 
@@ -378,11 +341,8 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
                             raw_stream_uri = source['uri']
                     if raw_stream_uri:
                         break
-        else:
-            logging.warning(f"No providers/sources for asset {asset_id} (channel {channel_id})")
 
         if not raw_stream_uri:
-            logging.warning(f"No stream URI for asset {asset_id} (channel {channel_id})")
             time.sleep(API_DELAY_SECONDS)
             continue
 
@@ -392,8 +352,6 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
             updated['stream_url'] = processed_stream_url
             channels_with_streams.append(updated)
             processed_count += 1
-        else:
-            logging.warning(f"Failed to process stream URI for asset {asset_id} (channel {channel_id})")
 
         time.sleep(API_DELAY_SECONDS)
 
@@ -401,23 +359,7 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
     return channels_with_streams
 
 
-# --- EPG ---
-
-def extract_assets(page_data):
-    """Returns {assetId: details} from an EPG page, whether 'assets' is dict or list."""
-    assets = page_data.get('assets')
-    if isinstance(assets, dict):
-        return assets
-    if isinstance(assets, list):
-        out = {}
-        for a in assets:
-            if isinstance(a, dict):
-                aid = a.get('id') or a.get('assetId')
-                if aid:
-                    out[str(aid)] = a
-        return out
-    return {}
-
+# --- EPG Fetching ---
 
 ASSET_INFO_URL_TEMPLATES = [
     f"{ANDROID_TV_ENDPOINT}/assets/asset/{{asset_id}}.json?f=title&f=descriptions",
@@ -425,9 +367,6 @@ ASSET_INFO_URL_TEMPLATES = [
 ]
 ASSET_INFO_WORKERS = 8
 ASSET_INFO_TIMEOUT = 10
-ASSET_INFO_BUDGET = 3000  # raised from 1500
-ASSET_INFO_PROBE = 40
-
 
 def fetch_asset_info(asset_id):
     for tmpl, headers in zip(ASSET_INFO_URL_TEMPLATES, (ANDROID_TV_HEADERS, WEB_HEADERS)):
@@ -439,59 +378,36 @@ def fetch_asset_info(asset_id):
 
 
 def fetch_epg_data(channel_list):
-    """Fetch EPG from Valencia: one request per page, offset pagination.
-
-    URL: /v2/epg/10006/{YYYYMMDD}/0.json?limit=50&offset={N}
-    Returns schedule rows; asset details must be looked up separately.
-    """
     if not channel_list:
         return {}
-    logging.info(f"Fetching EPG for {len(channel_list)} channels via {PRIMARY_LIST_ID}...")
+    logging.info(f"Fetching EPG for {len(channel_list)} channels...")
     channel_ids_in_final_list = {ch['id'] for ch in channel_list}
-    assets_cache = {}
-    schedule_rows = []  # (channel_id, start, end, assetId)
+    schedule_rows = []
 
+    # Fetch Yesterday through +2 Days to avoid EPG gaps
     today = datetime.now(timezone.utc)
-    dates_to_fetch = [today + timedelta(days=d) for d in range(EPG_FETCH_DAYS)]
-    total_requests = 0
-    logged_shape = False
-    logged_sample = False
+    start_day = today - timedelta(days=1)
+    dates_to_fetch = [start_day + timedelta(days=d) for d in range(EPG_FETCH_DAYS + 1)]
 
-    # Pass 1: collect schedule rows across pages
     for date_obj in dates_to_fetch:
         date_str = date_obj.strftime('%Y%m%d')
         logging.info(f"Fetching EPG for date: {date_str}")
         offset = 0
         seen_channels = 0
         page_idx = 0
+        
         while page_idx < EPG_MAX_PAGES:
             page_idx += 1
-            total_requests += 1
             fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, offset=offset)
             page_data = fetch_data(fetch_url, is_json=True, retries=0, delay=0, headers=WEB_HEADERS)
+            
             if not page_data or not isinstance(page_data, dict):
-                logging.warning(f"EPG page failed/empty: date={date_str}, offset={offset}")
+                logging.warning(f"EPG page failed: date={date_str} offset={offset}")
                 break
-
-            if not logged_shape:
-                logged_shape = True
-                logging.info(f"EPG page keys: {list(page_data.keys())}; "
-                             f"totalChannels={page_data.get('totalChannels')}; "
-                             f"'assets' type={type(page_data.get('assets')).__name__}")
-
-            assets_cache.update(extract_assets(page_data))
 
             channels_on_page = page_data.get('channels', [])
             if not isinstance(channels_on_page, list) or not channels_on_page:
-                logging.info(f"Empty 'channels' on date={date_str} offset={offset}; stopping.")
                 break
-
-            if not logged_sample:
-                logged_sample = True
-                epg_ids = [str(cs.get('channelId')) for cs in channels_on_page[:10]]
-                overlap = set(epg_ids) & channel_ids_in_final_list
-                logging.info(f"Sample EPG channelIds: {epg_ids}")
-                logging.info(f"Overlap with M3U list (first 10): {len(overlap)} match")
 
             for cs in channels_on_page:
                 channel_id = str(cs.get('channelId'))
@@ -505,55 +421,59 @@ def fetch_epg_data(channel_list):
                         continue
                     schedule_rows.append((channel_id, start, end, asset_id))
 
-            seen_channels += len(channels_on_page)
+            n = len(channels_on_page)
+            seen_channels += n
             total = page_data.get('totalChannels') or 0
-            logging.debug(f"  date={date_str} offset={offset} page={page_idx} "
-                          f"got={len(channels_on_page)} total={total} cumulative={seen_channels}")
+            
+            logging.debug(f"  date={date_str} offset={offset} got={n} cumulative={seen_channels}/{total}")
+
+            # CRITICAL FIX: Advance by the actual number of channels returned, not the limit
+            offset += n
+
             if total and seen_channels >= total:
                 break
-            if len(channels_on_page) < EPG_PAGE_LIMIT and not total:
+            if n == 0:
                 break
-            offset += EPG_PAGE_LIMIT
+
             time.sleep(API_DELAY_SECONDS)
 
-    logging.info(f"EPG pages done: {total_requests} requests, "
-                 f"{len(schedule_rows)} schedule rows, {len(assets_cache)} inline assets.")
+    logging.info(f"EPG pages done: {len(schedule_rows)} total schedule rows collected.")
 
-    # Pass 2: load title cache + look up missing
+    # Diagnostics for EPG Coverage
+    per_channel = Counter(r[0] for r in schedule_rows)
+    channels_with_epg = sum(1 for cid in channel_ids_in_final_list if per_channel.get(cid, 0) > 0)
+    channels_zero = len(channel_ids_in_final_list) - channels_with_epg
+    logging.info(f"EPG coverage: {channels_with_epg}/{len(channel_ids_in_final_list)} channels have programmes; {channels_zero} have none.")
+
+    # Load Cache
     cache_path = os.path.join(OUTPUT_DIR, TITLE_CACHE_FILENAME)
-    title_cache = {}
+    assets_cache = {}
     try:
         with open(cache_path, encoding="utf-8") as f:
             title_cache = json.load(f)
-        if not isinstance(title_cache, dict):
-            title_cache = {}
+            if isinstance(title_cache, dict):
+                assets_cache.update(title_cache)
     except FileNotFoundError:
         pass
-    except Exception as e:
-        logging.warning(f"Could not read title cache {cache_path}: {e}")
-
-    for r in schedule_rows:
-        aid = r[3]
-        if aid not in assets_cache and aid in title_cache:
-            assets_cache[aid] = title_cache[aid]
 
     def has_title(aid):
         d = assets_cache.get(aid)
         return isinstance(d, dict) and bool(d.get("title"))
 
     missing = sorted({r[3] for r in schedule_rows if not has_title(r[3])})
+    
+    # Limit title lookups so the script finishes in a reasonable time (rest fallback to Asset ID)
     if missing:
-        logging.info(f"Looking up {len(missing)} asset titles "
-                     f"({ASSET_INFO_WORKERS} workers, budget {ASSET_INFO_BUDGET}s)...")
+        lookup_limit = min(len(missing), 300) 
+        logging.info(f"Attempting to look up {lookup_limit} missing titles (limiting to 300 to save time)...")
+        
         found = 0
-        done = 0
         t0 = time.time()
-        aborted = None
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=ASSET_INFO_WORKERS)
-        futures = {pool.submit(fetch_asset_info, aid): aid for aid in missing}
+        futures = {pool.submit(fetch_asset_info, aid): aid for aid in missing[:lookup_limit]}
+        
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=ASSET_INFO_BUDGET):
-                done += 1
+            for fut in concurrent.futures.as_completed(futures, timeout=120): 
                 try:
                     info = fut.result()
                 except Exception:
@@ -561,18 +481,11 @@ def fetch_epg_data(channel_list):
                 if info:
                     assets_cache[futures[fut]] = info
                     found += 1
-                if done % 500 == 0:
-                    logging.info(f"  asset lookup: {done}/{len(missing)} done, "
-                                 f"{found} resolved, {int(time.time()-t0)}s")
-                if done == ASSET_INFO_PROBE and found == 0:
-                    aborted = f"first {ASSET_INFO_PROBE} lookups all failed"
-                    break
         except concurrent.futures.TimeoutError:
-            aborted = f"budget of {ASSET_INFO_BUDGET}s exceeded"
+            logging.warning("Asset lookup timed out. Proceeding with whatever we got.")
+        
         pool.shutdown(wait=False, cancel_futures=True)
-        if aborted:
-            logging.error(f"Asset lookup stopped early: {aborted}. Resolved {found}/{len(missing)}.")
-        logging.info(f"Asset lookup resolved {found}/{len(missing)} in {int(time.time()-t0)}s.")
+        logging.info(f"Asset lookup resolved {found}/{lookup_limit} in {int(time.time()-t0)}s.")
 
     # Save pruned cache
     try:
@@ -589,40 +502,41 @@ def fetch_epg_data(channel_list):
         ensure_output_dir()
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
-        logging.info(f"Title cache saved: {len(out)} entries -> {cache_path}")
     except Exception as e:
         logging.warning(f"Could not write title cache: {e}")
 
-    # Pass 3: consolidate per channel
+    # Consolidate
     consolidated_epg = {ch['id']: [] for ch in channel_list}
     seen = set()
     stored = 0
-    skipped = 0
     for channel_id, start, end, asset_id in schedule_rows:
         key = (channel_id, start, asset_id)
         if key in seen:
             continue
         seen.add(key)
+        
         details = assets_cache.get(asset_id)
-        if not details or not details.get('title'):
-            skipped += 1
-            continue
+        
+        # Fallback to Asset ID if no title is found
+        title = details.get('title') if details else asset_id
+        descriptions = details.get('descriptions', {}) if details else {}
+        episode_title = details.get('episodeTitle') if details else None
+
         consolidated_epg[channel_id].append({
             'start': start,
             'end': end,
             'assetId': asset_id,
-            'title': details.get('title', 'Unknown Program'),
-            'descriptions': details.get('descriptions', {}) or {},
-            'episodeTitle': details.get('episodeTitle'),
+            'title': title,
+            'descriptions': descriptions,
+            'episodeTitle': episode_title,
         })
         stored += 1
 
-    logging.info(f"Consolidated: {len(schedule_rows)} raw rows -> {stored} stored "
-                 f"({skipped} skipped: no title).")
+    logging.info(f"Consolidated: {len(schedule_rows)} raw rows -> {stored} stored.")
     return consolidated_epg
 
 
-# --- Generate M3U and EPG XML ---
+# --- Generate XML & M3U ---
 
 def generate_epg_xml(channel_list_with_streams, consolidated_epg_data):
     logging.info("Generating EPG XML structure...")
@@ -636,33 +550,28 @@ def generate_epg_xml(channel_list_with_streams, consolidated_epg_data):
         if channel['logo']:
             ET.SubElement(chan_el, 'icon', attrib={'src': channel['logo']})
 
-    total_programs_in_data = sum(len(progs) for progs in consolidated_epg_data.values())
-    logging.debug(f"Total program entries available: {total_programs_in_data}")
-
     for channel_id, programs in consolidated_epg_data.items():
         if channel_id not in channel_ids_in_list:
             continue
         for program in programs:
-            program_asset_id = program.get('assetId', 'N/A')
-            program_title = program.get('title', 'N/A')
             try:
                 start_time = parse_iso_datetime(program.get('start'))
                 end_time = parse_iso_datetime(program.get('end'))
                 if not start_time or not end_time:
-                    logging.warning(f"  Skip program (time parse fail): "
-                                    f"AssetID={program_asset_id} Title='{program_title}'")
                     continue
+                
                 title = program.get('title', 'Unknown Program')
                 desc_obj = program.get('descriptions', {})
                 desc = (desc_obj.get('large') or desc_obj.get('medium')
                         or desc_obj.get('small') or desc_obj.get('tiny'))
                 episode_title = program.get('episodeTitle')
                 asset_id = program.get('assetId')
+                
                 start_formatted = format_xmltv_time(start_time)
                 stop_formatted = format_xmltv_time(end_time)
                 if not start_formatted or not stop_formatted:
-                    logging.warning(f"  Skip program (format fail): AssetID={program_asset_id}")
                     continue
+                
                 prog_el = ET.SubElement(tv_element, 'programme', attrib={
                     'start': start_formatted,
                     'stop': stop_formatted,
@@ -677,13 +586,10 @@ def generate_epg_xml(channel_list_with_streams, consolidated_epg_data):
                     system_type = "dd_progid" if asset_id.startswith("EP") else "dd_assetid"
                     ET.SubElement(prog_el, 'episode-num', attrib={'system': system_type}).text = asset_id
                 programme_count += 1
-            except Exception as e:
-                logging.exception(f"Error processing program {program_asset_id}: {e}")
+            except Exception:
+                pass
 
     logging.info(f"Generated XML: {len(channel_list_with_streams)} channels, {programme_count} programmes.")
-    if programme_count == 0 and total_programs_in_data > 0:
-        logging.warning("EPG data was fetched but no valid program entries were added. "
-                        "Check channel ID matching + time parsing in DEBUG logs.")
     return ET.ElementTree(tv_element)
 
 
@@ -707,6 +613,7 @@ def generate_m3u_playlist(channel_list_with_streams):
         group_title = channel.get('group', 'General').replace(',', ';')
         tvg_name = channel['name'].replace('"', "'")
         logo = channel.get("logo", "")
+        
         if stream_url:
             playlist_parts.append(
                 f'#EXTINF:-1 tvg-id="{channel_id}" tvg-name="{tvg_name}" '
@@ -716,6 +623,7 @@ def generate_m3u_playlist(channel_list_with_streams):
             added_count += 1
         else:
             logging.error(f"Channel {channel_id} ({channel['name']!r}) reached M3U without stream URL!")
+            
     logging.info(f"Added {added_count} channels with stream URLs to M3U.")
     return "".join(playlist_parts)
 
