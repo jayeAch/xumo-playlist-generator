@@ -9,14 +9,28 @@ on:
     # See: https://crontab.guru/
     - cron: '0 4 * * *'
 
+# Required so the GITHUB_TOKEN can push commits back to the repo.
+# Without this, `git push` from Actions fails with a 403 on repos created after ~2023.
+permissions:
+  contents: write
+
+# Prevent overlapping runs from racing on push (manual + scheduled).
+concurrency:
+  group: generate-xumo
+  cancel-in-progress: false
+
 jobs:
   generate: # Name of the job
     runs-on: ubuntu-latest # Use the latest Ubuntu runner
+    timeout-minutes: 30
 
     steps:
       # Step 1: Check out the repository code
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can safely compare/commit against origin/main
+          fetch-depth: 0
 
       # Step 2: Set up Python environment
       - name: Set up Python
@@ -26,7 +40,7 @@ jobs:
 
       # Step 3: Install required Python dependencies
       - name: Install dependencies
-        run: pip install requests # Add other dependencies here if needed
+        run: pip install requests
 
       # Step 4: Run the Python script to generate the files and add debugging
       - name: Run Xumo Scraper and Debug File Output
@@ -41,9 +55,8 @@ jobs:
           echo "--- 'playlists' dir contents BEFORE script ---"
           ls -la playlists/ || echo "INFO: 'playlists' directory does not exist yet."
 
-          # --- IMPORTANT: REPLACE 'your_script_name.py' with the actual filename ---
-          echo "--- Running Python Script: generate_xumo.py ---" # Assuming this is your filename now
-          python generate_xumo.py # <<< CHANGE THIS FILENAME if it's different
+          echo "--- Running Python Script: generate_xumo.py ---"
+          python generate_xumo.py
 
           echo "--- Python Script Finished ---"
 
@@ -77,51 +90,45 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
+          echo "--- Sanity check: is anything in playlists/ ignored by .gitignore? ---"
+          git check-ignore -v playlists/xumo_playlist.m3u playlists/xumo_epg.xml.gz || echo "INFO: Neither output file is ignored."
+
           echo "--- Running git status before add ---"
           git status --untracked-files=no
 
-          # Check if git *thinks* there are changes before forcing the add
-          # This is just for logging comparison
-          if git status --porcelain playlists/xumo_playlist.m3u playlists/xumo_epg.xml.gz | grep -E '^[ AM]'; then
-             echo "INFO: Git status detected changes before add."
-          else
-             echo "INFO: Git status detected NO changes before add. Forcing add to test .gitignore..."
-          fi
+          echo "--- Staging output files ---"
+          git add playlists/xumo_playlist.m3u playlists/xumo_epg.xml.gz
 
-          # --- MODIFICATION HERE: Use --force ---
-          echo "--- Attempting: git add --force playlists/... ---"
-          git add --force playlists/xumo_playlist.m3u playlists/xumo_epg.xml.gz
-
-          echo "--- Running git status after add --force ---"
+          echo "--- Running git status after add ---"
           git status
 
-          # Commit the changes. If 'git add --force' staged something, this should commit.
-          # If the content was truly identical, commit might still say nothing to commit.
           echo "--- Attempting commit ---"
-          git commit -m "Update Xumo M3U playlist and EPG ($(date +'%Y-%m-%d %H:%M:%S %Z')) [skip ci]" || echo "INFO: No changes to commit (content likely identical or add failed)."
-
-          # Only try pushing if the commit command actually created a commit
-          # Check if HEAD changed compared to remote origin/main
-          if ! git diff --quiet HEAD origin/main -- playlists/; then
-             echo "--- Commit successful, attempting to push changes ---"
-             # Retry push logic
-             n=0
-             until [ $n -ge 5 ]
-             do
-                git push && break
-                n=$((n+1))
-                echo "WARNING: Push failed. Retrying attempt $n/5 in 15 seconds..."
-                sleep 15
-             done
-
-             if [ $n -ge 5 ]; then
-                echo "::error::Failed to push Xumo changes after multiple attempts."
-                exit 1
-             fi
-             echo "--- Push successful ---"
-          else
-              echo "INFO: No effective changes were committed (HEAD matches origin/main for playlists/). Nothing to push."
-              exit 0
+          if ! git commit -m "Update Xumo M3U playlist and EPG ($(date +'%Y-%m-%d %H:%M:%S %Z'))"; then
+            echo "INFO: No changes to commit (content likely identical)."
+            exit 0
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "--- Commit created successfully ---"
+
+          echo "--- Fetching origin/main to check for pending commits ---"
+          git fetch origin main
+
+          if [ "$(git rev-list --count origin/main..HEAD)" -gt 0 ]; then
+            echo "--- Commit(s) pending push, attempting push with retries ---"
+            n=0
+            until [ $n -ge 5 ]
+            do
+               git push && break
+               n=$((n+1))
+               echo "WARNING: Push failed. Retrying attempt $n/5 in 15 seconds..."
+               sleep 15
+            done
+
+            if [ $n -ge 5 ]; then
+               echo "::error::Failed to push Xumo changes after multiple attempts."
+               exit 1
+            fi
+            echo "--- Push successful ---"
+          else
+            echo "INFO: No commits ahead of origin/main. Nothing to push."
+            exit 0
+          fi
