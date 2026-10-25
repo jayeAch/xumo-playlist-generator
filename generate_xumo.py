@@ -40,7 +40,7 @@ EPG_FETCH_URL_TEMPLATE = f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_
 XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id}/168x168.png?type=color_onBlack"
 
 # --- Script Settings ---
-EPG_FETCH_DAYS = 2
+EPG_FETCH_DAYS = 1
 MAX_EPG_OFFSET = 1000  # 436 channels need offset 400; old limit of 350 skipped the last page
 HOURS_TO_FETCH = 24  # retained for backwards compat; no longer used by EPG fetch
 API_DELAY_SECONDS = 0.10
