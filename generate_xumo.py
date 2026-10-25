@@ -27,11 +27,14 @@ ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}
 
 # --- EPG Settings ---
 EPG_FETCH_DAYS = 3  # Yesterday, Today, Tomorrow, +2 Days
+# The trailing path segment of the EPG URL is a time block, NOT a constant.
+# "0" only returns ~00:00-06:00 UTC, which caused the 17-18h gaps.
+EPG_HOUR_BLOCKS = [0, 6, 12, 18]
 EPG_PAGE_LIMIT = 50
 EPG_MAX_PAGES = 50  # Safety cap per date
 # FIX: Add f=asset.title and f=asset.descriptions so EPG returns program titles/descriptions inline
 EPG_FETCH_URL_TEMPLATE = (
-    f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/0.json"
+    f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/{{block}}.json"
     f"?f=asset.title&f=asset.descriptions&limit={EPG_PAGE_LIMIT}&offset={{offset}}"
 )
 
@@ -369,14 +372,14 @@ ASSET_INFO_URL_TEMPLATES = [
     f"{ANDROID_TV_ENDPOINT}/assets/asset/{{asset_id}}.json?f=title&f=descriptions",
     f"{VALENCIA_API_ENDPOINT}/assets/asset/{{asset_id}}.json?f=title&f=descriptions",
 ]
-ASSET_INFO_WORKERS = 8
-ASSET_INFO_TIMEOUT = 10
+ASSET_INFO_WORKERS = 16
+ASSET_INFO_TIMEOUT = 15
 
 
 def fetch_asset_info(asset_id):
     for tmpl, headers in zip(ASSET_INFO_URL_TEMPLATES, (ANDROID_TV_HEADERS, WEB_HEADERS)):
-        data = fetch_data(tmpl.format(asset_id=asset_id), is_json=True, retries=0,
-                          delay=0, headers=headers, timeout=ASSET_INFO_TIMEOUT)
+        data = fetch_data(tmpl.format(asset_id=asset_id), is_json=True, retries=1,
+                          delay=1, headers=headers, timeout=ASSET_INFO_TIMEOUT)
         if isinstance(data, dict) and data.get('title'):
             return data
     return None
@@ -421,61 +424,55 @@ def fetch_epg_data(channel_list):
 
     for date_obj in dates_to_fetch:
         date_str = date_obj.strftime('%Y%m%d')
-        logging.info(f"Fetching EPG for date: {date_str}")
-        offset = 0
-        seen_channels = 0
-        page_idx = 0
+        for block in EPG_HOUR_BLOCKS:
+            logging.info(f"Fetching EPG for date: {date_str} block: {block}")
+            offset = 0
+            seen_channels = 0
+            page_idx = 0
 
-        while page_idx < EPG_MAX_PAGES:
-            page_idx += 1
-            fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, offset=offset)
-            page_data = fetch_data(fetch_url, is_json=True, retries=0, delay=0, headers=WEB_HEADERS)
+            while page_idx < EPG_MAX_PAGES:
+                page_idx += 1
+                fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, block=block, offset=offset)
+                page_data = fetch_data(fetch_url, is_json=True, retries=1, delay=1, headers=WEB_HEADERS)
 
-            if not page_data or not isinstance(page_data, dict):
-                logging.warning(f"EPG page failed: date={date_str} offset={offset}")
-                break
+                if not page_data or not isinstance(page_data, dict):
+                    logging.warning(f"EPG page failed: date={date_str} block={block} offset={offset}")
+                    break
 
-            channels_on_page = page_data.get('channels', [])
-            if not isinstance(channels_on_page, list) or not channels_on_page:
-                break
+                channels_on_page = page_data.get('channels', [])
+                if not isinstance(channels_on_page, list) or not channels_on_page:
+                    break
 
-            for cs in channels_on_page:
-                channel_id = str(cs.get('channelId'))
-                if channel_id not in channel_ids_in_final_list:
-                    continue
-                for ps in cs.get('schedule', []):
-                    asset_id = ps.get('assetId')
-                    start = ps.get('start')
-                    end = ps.get('end')
-                    if not asset_id or not start or not end:
+                for cs in channels_on_page:
+                    channel_id = str(cs.get('channelId'))
+                    if channel_id not in channel_ids_in_final_list:
                         continue
-                    # Capture inline title/descriptions when present
-                    inline_title, inline_desc, inline_ep = _extract_inline_asset_info(ps)
-                    schedule_rows.append({
-                        'channel_id': channel_id,
-                        'start': start,
-                        'end': end,
-                        'asset_id': asset_id,
-                        'inline_title': inline_title,
-                        'inline_desc': inline_desc,
-                        'inline_episode': inline_ep,
-                    })
+                    for ps in cs.get('schedule', []):
+                        asset_id = ps.get('assetId')
+                        start = ps.get('start')
+                        end = ps.get('end')
+                        if not asset_id or not start or not end:
+                            continue
+                        inline_title, inline_desc, inline_ep = _extract_inline_asset_info(ps)
+                        schedule_rows.append({
+                            'channel_id': channel_id,
+                            'start': start,
+                            'end': end,
+                            'asset_id': asset_id,
+                            'inline_title': inline_title,
+                            'inline_desc': inline_desc,
+                            'inline_episode': inline_ep,
+                        })
 
-            n = len(channels_on_page)
-            seen_channels += n
-            total = page_data.get('totalChannels') or 0
+                n = len(channels_on_page)
+                seen_channels += n
+                total = page_data.get('totalChannels') or 0
+                logging.debug(f"  date={date_str} block={block} offset={offset} got={n} cumulative={seen_channels}/{total}")
+                offset += n
 
-            logging.debug(f"  date={date_str} offset={offset} got={n} cumulative={seen_channels}/{total}")
-
-            # Advance by the actual number of channels returned, not the limit
-            offset += n
-
-            if total and seen_channels >= total:
-                break
-            if n == 0:
-                break
-
-            time.sleep(API_DELAY_SECONDS)
+                if total and seen_channels >= total:
+                    break
+                time.sleep(API_DELAY_SECONDS)
 
     logging.info(f"EPG pages done: {len(schedule_rows)} total schedule rows collected.")
 
@@ -519,8 +516,8 @@ def fetch_epg_data(channel_list):
 
     # FIX: raise lookup cap now that inline titles cover most rows
     if missing:
-        lookup_limit = min(len(missing), 1500)
-        logging.info(f"Attempting to look up {lookup_limit} missing titles (cap 1500)...")
+        lookup_limit = len(missing)
+        logging.info(f"Attempting to look up {lookup_limit} missing titles...")
 
         found = 0
         t0 = time.time()
@@ -528,7 +525,7 @@ def fetch_epg_data(channel_list):
         futures = {pool.submit(fetch_asset_info, aid): aid for aid in missing[:lookup_limit]}
 
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=180):
+            for fut in concurrent.futures.as_completed(futures, timeout=900):
                 try:
                     info = fut.result()
                 except Exception:
@@ -564,6 +561,7 @@ def fetch_epg_data(channel_list):
     consolidated_epg = {ch['id']: [] for ch in channel_list}
     seen = set()
     stored = 0
+    unresolved = 0
     for row in schedule_rows:
         channel_id = row['channel_id']
         start = row['start']
@@ -585,9 +583,9 @@ def fetch_epg_data(channel_list):
             descriptions = row.get('inline_desc') or {}
             episode_title = row.get('inline_episode')
         else:
-            title = asset_id
-            descriptions = {}
-            episode_title = None
+            # Unresolved asset: skip rather than publish a raw ID like "XM0WYASIG6RGO3"
+            unresolved += 1
+            continue
 
         consolidated_epg[channel_id].append({
             'start': start,
@@ -599,7 +597,7 @@ def fetch_epg_data(channel_list):
         })
         stored += 1
 
-    logging.info(f"Consolidated: {len(schedule_rows)} raw rows -> {stored} stored.")
+    logging.info(f"Consolidated: {len(schedule_rows)} raw rows -> {stored} stored, {unresolved} skipped (no title).")
     return consolidated_epg
 
 
