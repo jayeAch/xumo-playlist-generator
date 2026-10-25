@@ -26,7 +26,7 @@ BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channe
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
 # --- EPG Settings ---
-EPG_FETCH_DAYS = 1  # Yesterday, Today, Tomorrow, +2 Days
+EPG_FETCH_DAYS = 2  # Yesterday, Today, Tomorrow, +2 Days
 # The trailing path segment of the EPG URL selects a slice of the day.
 # "0" alone only returns ~00:00-06:00 UTC (17-18h gaps). Valid values are
 # discovered at runtime by probing (see discover_epg_blocks) because 6/12/18 return HTTP 400.
