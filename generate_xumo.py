@@ -29,15 +29,19 @@ PRIMARY_CHANNEL_LIST_URL = f"{VALENCIA_API_ENDPOINT}/proxy/channels/list/{PRIMAR
 BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channel_id}}/broadcast.json?hour={{hour_num}}"
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
-# EPG URL (Using Valencia endpoint and primary list ID, with hourly iteration)
-EPG_FETCH_URL_TEMPLATE = f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/{{hour}}.json?limit=50&offset={{offset}}&f=asset.title&f=asset.descriptions"
+# EPG URL (Using Valencia endpoint and primary list ID).
+# Confirmed working URL shape (tested 2026-10-25):
+#   https://valencia-app-mds.xumo.com/v2/epg/10006/YYYYMMDD/0.json?limit=50&offset=N
+# Do NOT add &f=asset.title&f=asset.descriptions — those caused HTTP 400.
+# Hour must be 0; server returns the day's schedule for that list.
+EPG_FETCH_URL_TEMPLATE = f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/0.json?limit=50&offset={{offset}}"
 
 XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id}/168x168.png?type=color_onBlack"
 
 # --- Script Settings ---
 EPG_FETCH_DAYS = 2
 MAX_EPG_OFFSET = 350
-HOURS_TO_FETCH = 24
+HOURS_TO_FETCH = 24  # retained for backwards compat; no longer used by EPG fetch
 API_DELAY_SECONDS = 0.10
 OUTPUT_DIR = "playlists"
 PLAYLIST_FILENAME = "xumo_playlist.m3u"
@@ -101,7 +105,10 @@ def fetch_data(url, params=None, is_json=True, retries=2, delay=2, headers=WEB_H
 
 def parse_iso_datetime(iso_time_str):
     """Parses ISO 8601 string, handling 'Z', milliseconds, and '+HHMM' timezone format."""
-    if not iso_time_str: logging.debug("parse_iso_datetime received empty string."); return None
+    if not iso_time_str:
+        # Common case: Xumo broadcast assets often have empty start/end.
+        # Don't spam the log; caller handles None gracefully.
+        return None
     try:
         original_str = iso_time_str
         if iso_time_str.endswith('Z'): iso_time_str = iso_time_str[:-1] + '+00:00'
@@ -234,7 +241,11 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
             for asset in broadcast_data['assets']:
                 start_time = parse_iso_datetime(asset.get('start')); end_time = parse_iso_datetime(asset.get('end'))
                 if start_time and end_time and start_time <= now_utc < end_time: current_asset = asset; break
-            if not current_asset and broadcast_data['assets']: current_asset = broadcast_data['assets'][0]
+            if not current_asset and broadcast_data['assets']:
+                # Fallback: Xumo broadcast assets often have no start/end. Trust the first item
+                # (server returns current-first), rather than dropping the channel.
+                current_asset = broadcast_data['assets'][0]
+                logging.debug(f"No time-matched asset for {channel_id}; using first asset in broadcast list (Xumo often omits start/end).")
             if current_asset: asset_id = current_asset.get('id')
             if asset_id: logging.debug(f"Found current asset ID {asset_id} for channel {channel_id}")
             else: logging.warning(f"Relevant asset in broadcast data for channel {channel_id} has no ID.")
@@ -279,46 +290,79 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
 
 
 def fetch_epg_data(channel_list):
-    """Fetches EPG data using the Valencia endpoint (10006), iterating through hours and offsets."""
+    """Fetches EPG data using the Valencia endpoint, one request per date with offset pagination.
+
+    Confirmed working URL shape (candidate B, tested 2026-10-25):
+        /v2/epg/10006/{YYYYMMDD}/0.json?limit=50&offset={N}
+    Hour is fixed at 0; the server returns the day's schedule for that list.
+    Do NOT add &f=asset.title&f=asset.descriptions — those params caused HTTP 400.
+    """
     if not channel_list: return {}
     logging.info(f"Fetching EPG data for {len(channel_list)} channels (using Valencia EPG endpoint {PRIMARY_LIST_ID})...")
     consolidated_epg = {channel['id']: [] for channel in channel_list}; assets_cache = {}
     channel_ids_in_final_list = {ch['id'] for ch in channel_list}
     today = datetime.now(timezone.utc); dates_to_fetch = [today + timedelta(days=d) for d in range(EPG_FETCH_DAYS)]
     total_requests = 0; total_programs_fetched = 0; total_programs_added = 0
+
     for date_obj in dates_to_fetch:
         date_str = date_obj.strftime('%Y%m%d'); logging.info(f"Fetching EPG for date: {date_str}")
         offset = 0
         while offset <= MAX_EPG_OFFSET:
-            logging.debug(f"Processing EPG Offset Block: {offset}"); found_relevant_channel_in_offset_block = False
-            for hour in range(HOURS_TO_FETCH):
-                total_requests += 1
-                fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, hour=hour, offset=offset)
-                logging.debug(f"  Fetching EPG - Date={date_str}, Hour={hour}, Offset={offset} -> {fetch_url}")
-                page_data = fetch_data(fetch_url, is_json=True, retries=1, delay=1, headers=WEB_HEADERS)
-                if page_data and isinstance(page_data, dict):
-                    if 'assets' in page_data and isinstance(page_data['assets'], dict): assets_cache.update(page_data['assets'])
-                    if 'channels' in page_data and isinstance(page_data['channels'], list):
-                        processed_channels_this_page = 0; programs_added_this_page = 0
-                        for channel_schedule_data in page_data['channels']:
-                            channel_id = str(channel_schedule_data.get('channelId'))
-                            if channel_id in channel_ids_in_final_list:
-                                found_relevant_channel_in_offset_block = True; processed_channels_this_page += 1
-                                if channel_id not in consolidated_epg: consolidated_epg[channel_id] = []
-                                for program_schedule in channel_schedule_data.get('schedule', []):
-                                    total_programs_fetched += 1; asset_id = program_schedule.get('assetId')
-                                    asset_details = assets_cache.get(asset_id)
-                                    if asset_details:
-                                        program_info = { 'start': program_schedule.get('start'), 'end': program_schedule.get('end'), 'assetId': asset_id, 'title': asset_details.get('title', 'Unknown Program'), 'descriptions': asset_details.get('descriptions',{}), 'episodeTitle': asset_details.get('episodeTitle'), }
-                                        if program_info['start'] and program_info['end']: consolidated_epg[channel_id].append(program_info); programs_added_this_page += 1; total_programs_added += 1
-                                        else: logging.warning(f"EPG: Program for asset {asset_id} on channel {channel_id} missing start/end time in schedule.")
-                                    else: logging.warning(f"EPG: Asset details not found for assetId {asset_id} on channel {channel_id} (Date={date_str}, Hour={hour}, Offset={offset})")
-                        if programs_added_this_page > 0: logging.debug(f"    Processed {processed_channels_this_page} relevant channels, added {programs_added_this_page} program entries from Hour {hour}.")
-                    else: logging.debug(f"    No 'channels' key found in response for Hour {hour}, Offset {offset}.")
-                else: logging.debug(f"    Failed to fetch or invalid data for Hour {hour}, Offset {offset}. Skipping.")
-                time.sleep(API_DELAY_SECONDS / 2)
-            logging.debug(f"Finished processing all hours for Offset Block: {offset}")
-            offset += 50; time.sleep(API_DELAY_SECONDS)
+            total_requests += 1
+            fetch_url = EPG_FETCH_URL_TEMPLATE.format(date_str=date_str, offset=offset)
+            logging.debug(f"  Fetching EPG - Date={date_str}, Offset={offset} -> {fetch_url}")
+
+            # retries=0: a 400 here is deterministic (bad URL shape), retrying wastes ~12s each.
+            page_data = fetch_data(fetch_url, is_json=True, retries=0, delay=0, headers=WEB_HEADERS)
+
+            if not page_data or not isinstance(page_data, dict):
+                logging.warning(f"EPG page failed or empty for date={date_str}, offset={offset}. Stopping pagination for this date.")
+                break
+
+            if 'assets' in page_data and isinstance(page_data['assets'], dict):
+                assets_cache.update(page_data['assets'])
+
+            channels_on_page = page_data.get('channels', [])
+            if not isinstance(channels_on_page, list) or not channels_on_page:
+                logging.debug(f"No channels in page (date={date_str}, offset={offset}) — end of data for this date.")
+                break
+
+            for channel_schedule_data in channels_on_page:
+                channel_id = str(channel_schedule_data.get('channelId'))
+                if channel_id not in channel_ids_in_final_list:
+                    continue
+                if channel_id not in consolidated_epg:
+                    consolidated_epg[channel_id] = []
+                for program_schedule in channel_schedule_data.get('schedule', []):
+                    total_programs_fetched += 1
+                    asset_id = program_schedule.get('assetId')
+                    asset_details = assets_cache.get(asset_id)
+                    if not asset_details:
+                        logging.warning(f"EPG: Asset details not found for assetId {asset_id} on channel {channel_id} (Date={date_str}, Offset={offset})")
+                        continue
+                    start = program_schedule.get('start')
+                    end = program_schedule.get('end')
+                    if not start or not end:
+                        logging.warning(f"EPG: Program for asset {asset_id} on channel {channel_id} missing start/end time in schedule.")
+                        continue
+                    consolidated_epg[channel_id].append({
+                        'start': start,
+                        'end': end,
+                        'assetId': asset_id,
+                        'title': asset_details.get('title', 'Unknown Program'),
+                        'descriptions': asset_details.get('descriptions', {}),
+                        'episodeTitle': asset_details.get('episodeTitle'),
+                    })
+                    total_programs_added += 1
+
+            # End-of-data heuristic: fewer items than the limit means the server has no more.
+            if len(channels_on_page) < 50:
+                logging.debug(f"Page returned {len(channels_on_page)} channels (< limit 50) — treating as last page for date {date_str}.")
+                break
+
+            offset += 50
+            time.sleep(API_DELAY_SECONDS)
+
     logging.info(f"Finished fetching EPG data after {total_requests} requests.")
     logging.info(f"Found {total_programs_fetched} raw program entries, successfully stored {total_programs_added} entries.")
     logging.info("Removing duplicate program entries...")
@@ -421,7 +465,7 @@ if __name__ == "__main__":
 
     logging.info(f"Proceeding with {len(final_channel_list_with_streams)} channels confirmed to have stream URLs.")
 
-    # Step 3: Fetch EPG Data (Using new hourly method)
+    # Step 3: Fetch EPG Data (using hourly iteration - now one request per date)
     epg_data = fetch_epg_data(final_channel_list_with_streams)
 
     # Step 4: Generate EPG XML
