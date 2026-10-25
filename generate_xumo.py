@@ -45,7 +45,7 @@ EPG_FILENAME = "xumo_epg.xml.gz"
 REQUEST_TIMEOUT = 45
 
 # !!! GitHub Repo Info !!!
-GITHUB_USER = "BuddyChewChew"
+GITHUB_USER = "jayeAch"
 GITHUB_REPO = "xumo-playlist-generator"
 GITHUB_BRANCH = "main"
 EPG_RAW_URL = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{OUTPUT_DIR}/{EPG_FILENAME}"
