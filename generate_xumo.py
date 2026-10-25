@@ -307,6 +307,7 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
     logging.info(f"Attempting Android TV asset lookup for {len(channels_list)} channels...")
     processed_count = 0
     channels_with_streams = []
+    content_url_dumps = 0  # diagnostic: per-asset /content/ URLs behave like VOD
 
     for i, channel_info in enumerate(channels_list):
         channel_id = channel_info['id']
@@ -315,6 +316,7 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
         broadcast_data = fetch_data(broadcast_url, is_json=True, retries=1, headers=ANDROID_TV_HEADERS)
 
         asset_id = None
+        current_asset = None
         if broadcast_data and 'assets' in broadcast_data and broadcast_data['assets']:
             now_utc = datetime.now(timezone.utc)
             current_asset = None
@@ -353,6 +355,17 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
         if not raw_stream_uri:
             time.sleep(API_DELAY_SECONDS)
             continue
+
+        # Diagnostic: dump full broadcast + provider data for the first few channels whose
+        # URL is a per-asset file (live-content.xumo.com/.../content/<assetId>/...).
+        if '/content/' in raw_stream_uri and content_url_dumps < 3:
+            content_url_dumps += 1
+            try:
+                logging.info(f"[VOD-DIAG] channel={channel_info['name']!r} id={channel_id} asset={asset_id}")
+                logging.info(f"[VOD-DIAG] current_asset={json.dumps(current_asset)[:1500]}")
+                logging.info(f"[VOD-DIAG] asset_data={json.dumps(asset_data)[:6000]}")
+            except Exception as e:
+                logging.warning(f"[VOD-DIAG] dump failed: {e}")
 
         processed_stream_url = process_stream_uri(raw_stream_uri)
         if processed_stream_url:
