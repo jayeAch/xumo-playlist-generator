@@ -5,7 +5,7 @@ name: Generate Xumo Playlist and EPG
 on:
   workflow_dispatch: # Allows manual triggering from the Actions tab in GitHub
   schedule:
-    # Runs around 4 AM UTC daily (adjust cron schedule as needed)
+    # Runs every 6 hours (adjust cron schedule as needed)
     # See: https://crontab.guru/
     - cron: '0 */6 * * *'
 
@@ -82,7 +82,8 @@ jobs:
             echo "WARNING: playlists/xumo_epg.xml.gz MISSING!"
           fi
 
-      # Step 5: Commit and push the changes *only if* the scraper step found the playlist file
+      # Step 5: Commit and push the changes *only if* the scraper step found the playlist file.
+      # The push retries with a rebase onto origin/main in case main moved during the run.
       - name: Commit and Push Changes
         if: steps.scraper.outputs.changes_found == 'true'
         run: |
@@ -117,9 +118,14 @@ jobs:
             n=0
             until [ $n -ge 5 ]
             do
-               git push && break
+               # Remote main moved while the job was running (e.g. you pushed code/readme).
+               # Rebase onto it first; on conflict keep our freshly generated files.
+               if git pull --rebase -X theirs origin main && git push; then
+                  break
+               fi
+               git rebase --abort 2>/dev/null || true
                n=$((n+1))
-               echo "WARNING: Push failed. Retrying attempt $n/5 in 15 seconds..."
+               echo "WARNING: Pull/push failed. Retrying attempt $n/5 in 15 seconds..."
                sleep 15
             done
 
