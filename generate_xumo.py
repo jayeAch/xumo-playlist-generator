@@ -47,7 +47,7 @@ XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id
 # (live-content.xumo.com/<provider>/content/<assetId>/...), not a live stream. Players start
 # these at the beginning of the file and the URL goes stale when the program changes.
 # "keep" = leave as-is | "tag" = move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
-VOD_STYLE_MODE = "tag"
+VOD_STYLE_MODE = "drop"
 VOD_GROUP_TITLE = "VOD-style (starts at beginning)"
 
 # --- Script Settings ---
