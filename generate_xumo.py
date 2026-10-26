@@ -46,9 +46,20 @@ XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id
 # ~70 channels (Stash TV, FilmRise, Hell's Kitchen, ...) only expose a per-program VOD file
 # (live-content.xumo.com/<provider>/content/<assetId>/...), not a live stream. Players start
 # these at the beginning of the file and the URL goes stale when the program changes.
-# "keep" = leave as-is | "tag" = move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
-VOD_STYLE_MODE = "tag"
+# The official web player does NOT use that file for these channels. It plays a channel-level
+# live (SSAI) stream: https://dbrb49pjoymg4.cloudfront.net/10001/<channelId>/hls/master.m3u8?...
+# (seen in a Chrome net-export for Stash TV 99991300 and MGM Presents 99951573).
+# "live" = rewrite to that live URL (recommended) | "keep" = leave as-is
+# "tag"  = leave as-is but move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
+VOD_STYLE_MODE = "live"
 VOD_GROUP_TITLE = "VOD-style (starts at beginning)"
+VOD_LIVE_URL_TEMPLATE = (
+    "https://dbrb49pjoymg4.cloudfront.net/10001/{channel_id}/hls/master.m3u8"
+    "?includeAssetTags=true&ads.xumo_channelId={channel_id}&ads.xumo_streamId={channel_id}"
+    "&ads.channelId={channel_id}&ads.xumo_platform=web&ads.appName=xumo&ads.appVersion=1.0.0"
+    "&ads._fw_app_bundle=web.xumo.com&ads._fw_deviceMake=GitHubAction&ads._fw_device_model=PythonScript"
+    "&ads._fw_did={did}&ads._fw_is_lat=0&ads._fw_coppa=0&ads._fw_content_language=en"
+)
 
 # --- Script Settings ---
 API_DELAY_SECONDS = 0.10
@@ -784,6 +795,9 @@ if __name__ == "__main__":
     if VOD_STYLE_MODE == "drop":
         vod_ids = {c['id'] for c in vod_style}
         final_channel_list_with_streams = [c for c in final_channel_list_with_streams if c['id'] not in vod_ids]
+    elif VOD_STYLE_MODE == "live":
+        for c in vod_style:
+            c['stream_url'] = VOD_LIVE_URL_TEMPLATE.format(channel_id=c['id'], did=uuid.uuid4())
     elif VOD_STYLE_MODE == "tag":
         for c in vod_style:
             c['group'] = VOD_GROUP_TITLE
