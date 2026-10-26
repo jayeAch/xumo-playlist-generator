@@ -26,14 +26,15 @@ BROADCAST_NOW_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/channels/channel/{{channe
 ASSET_DETAILS_URL_TEMPLATE = f"{ASSET_LOOKUP_ENDPOINT}/assets/asset/{{asset_id}}.json?f=providers"
 
 # --- EPG Settings ---
-EPG_FETCH_DAYS = 3  # Yesterday, Today, Tomorrow, +2 Days
-# The trailing path segment of the EPG URL selects a slice of the day.
-# "0" alone only returns ~00:00-06:00 UTC (17-18h gaps). Valid values are
-# discovered at runtime by probing (see discover_epg_blocks) because 6/12/18 return HTTP 400.
+EPG_FETCH_DAYS = 3  # Days fetched AFTER yesterday: 2 = yesterday/today/tomorrow, 3 adds +2 days
+# The trailing path segment of the EPG URL selects a 6-hour slice of the UTC day.
+# "0" alone only returns ~00:00-06:00 UTC (17-18h gaps). Valid values (currently 0-3) are
+# discovered at runtime by probing (see discover_epg_blocks); 4+ return HTTP 400.
 EPG_PROBE_RANGE = range(0, 6)  # confirmed: 0-3 valid (6-hour slices), 4+ invalid
 EPG_PAGE_LIMIT = 50
 EPG_MAX_PAGES = 50  # Safety cap per date
-# FIX: Add f=asset.title and f=asset.descriptions so EPG returns program titles/descriptions inline
+# f=asset.title / f=asset.descriptions are requested in case the API returns titles inline,
+# but in practice it doesn't (0 inline hits), so titles come from per-asset lookups below.
 EPG_FETCH_URL_TEMPLATE = (
     f"{VALENCIA_API_ENDPOINT}/epg/{PRIMARY_LIST_ID}/{{date_str}}/{{block}}.json"
     f"?f=asset.title&f=asset.descriptions&limit={EPG_PAGE_LIMIT}&offset={{offset}}"
@@ -46,7 +47,7 @@ XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id
 # (live-content.xumo.com/<provider>/content/<assetId>/...), not a live stream. Players start
 # these at the beginning of the file and the URL goes stale when the program changes.
 # "keep" = leave as-is | "tag" = move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
-VOD_STYLE_MODE = "drop"
+VOD_STYLE_MODE = "tag"
 VOD_GROUP_TITLE = "VOD-style (starts at beginning)"
 
 # --- Script Settings ---
@@ -57,7 +58,7 @@ EPG_FILENAME = "xumo_epg.xml.gz"
 TITLE_CACHE_FILENAME = "asset_titles.json"
 REQUEST_TIMEOUT = 45
 
-# !!! GitHub Repo Info !!!
+# !!! GitHub Repo Info !!! (used to build the EPG URL written into the M3U; change if you fork)
 GITHUB_USER = "jayeAch"
 GITHUB_REPO = "xumo-playlist-generator"
 GITHUB_BRANCH = "main"
@@ -397,8 +398,9 @@ def fetch_asset_info(asset_id):
 
 
 def _extract_inline_asset_info(schedule_item):
-    """Extract title/description fields embedded directly in the EPG schedule item
-    (available when the request includes f=asset.title and f=asset.descriptions)."""
+    """Extract title/description fields embedded directly in the EPG schedule item.
+    The API currently returns none, so this normally yields (None, {}, None) and the
+    per-asset lookup is used instead. Kept in case inline data starts appearing."""
     asset = schedule_item.get('asset')
     if not isinstance(asset, dict):
         # Some responses nest under 'assetInfo' or return fields at top level
@@ -445,7 +447,7 @@ def fetch_epg_data(channel_list):
     channel_ids_in_final_list = {ch['id'] for ch in channel_list}
     schedule_rows = []
 
-    # Fetch Yesterday through +2 Days to avoid EPG gaps
+    # Fetch yesterday plus EPG_FETCH_DAYS days (yesterday catches programmes still airing from late UTC)
     today = datetime.now(timezone.utc)
     start_day = today - timedelta(days=1)
     dates_to_fetch = [start_day + timedelta(days=d) for d in range(EPG_FETCH_DAYS + 1)]
@@ -523,7 +525,7 @@ def fetch_epg_data(channel_list):
     channels_zero = len(channel_ids_in_final_list) - channels_with_epg
     logging.info(f"EPG coverage: {channels_with_epg}/{len(channel_ids_in_final_list)} channels have programmes; {channels_zero} have none.")
 
-    # Count inline hits vs misses
+    # Count inline hits vs misses (expected to be 0 with the current API)
     inline_hits = sum(1 for r in schedule_rows if r.get('inline_title'))
     logging.info(f"Inline title coverage from EPG response: {inline_hits}/{len(schedule_rows)} rows.")
 
@@ -538,7 +540,7 @@ def fetch_epg_data(channel_list):
     except FileNotFoundError:
         pass
 
-    # Seed cache with inline titles
+    # Seed cache with inline titles (no-op while the API returns none)
     for row in schedule_rows:
         aid = row['asset_id']
         if row.get('inline_title') and not (
@@ -559,7 +561,8 @@ def fetch_epg_data(channel_list):
     # soonest-airing first, so the current/next programmes always get titles
     missing = [aid for aid, _ in sorted(first_start.items(), key=lambda kv: kv[1]) if not has_title(aid)]
 
-    # FIX: raise lookup cap now that inline titles cover most rows
+    # Look up the remaining titles one asset at a time, soonest-airing first, within a time budget.
+    # Anything not resolved is skipped this run and picked up on later runs via the cache.
     if missing:
         lookup_limit = len(missing)
         logging.info(f"Attempting to look up {lookup_limit} missing titles (soonest first, {ASSET_LOOKUP_BUDGET_SECONDS}s budget)...")
@@ -618,7 +621,7 @@ def fetch_epg_data(channel_list):
 
         details = assets_cache.get(asset_id)
 
-        # Fallback chain: cached/inline -> asset_id
+        # Fallback chain: cached -> inline -> skipped (never publish a raw asset ID as the title)
         if details and details.get('title'):
             title = details.get('title')
             descriptions = details.get('descriptions') or {}
