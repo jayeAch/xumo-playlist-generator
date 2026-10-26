@@ -41,6 +41,14 @@ EPG_FETCH_URL_TEMPLATE = (
 
 XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id}/168x168.png?type=color_onBlack"
 
+# --- VOD-style channels ---
+# ~70 channels (Stash TV, FilmRise, Hell's Kitchen, ...) only expose a per-program VOD file
+# (live-content.xumo.com/<provider>/content/<assetId>/...), not a live stream. Players start
+# these at the beginning of the file and the URL goes stale when the program changes.
+# "keep" = leave as-is | "tag" = move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
+VOD_STYLE_MODE = "drop"
+VOD_GROUP_TITLE = "VOD-style (starts at beginning)"
+
 # --- Script Settings ---
 API_DELAY_SECONDS = 0.10
 OUTPUT_DIR = "playlists"
@@ -307,7 +315,6 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
     logging.info(f"Attempting Android TV asset lookup for {len(channels_list)} channels...")
     processed_count = 0
     channels_with_streams = []
-    content_url_dumps = 0  # diagnostic: per-asset /content/ URLs behave like VOD
 
     for i, channel_info in enumerate(channels_list):
         channel_id = channel_info['id']
@@ -355,17 +362,6 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
         if not raw_stream_uri:
             time.sleep(API_DELAY_SECONDS)
             continue
-
-        # Diagnostic: dump full broadcast + provider data for the first few channels whose
-        # URL is a per-asset file (live-content.xumo.com/.../content/<assetId>/...).
-        if '/content/' in raw_stream_uri and content_url_dumps < 3:
-            content_url_dumps += 1
-            try:
-                logging.info(f"[VOD-DIAG] channel={channel_info['name']!r} id={channel_id} asset={asset_id}")
-                logging.info(f"[VOD-DIAG] current_asset={json.dumps(current_asset)[:1500]}")
-                logging.info(f"[VOD-DIAG] asset_data={json.dumps(asset_data)[:6000]}")
-            except Exception as e:
-                logging.warning(f"[VOD-DIAG] dump failed: {e}")
 
         processed_stream_url = process_stream_uri(raw_stream_uri)
         if processed_stream_url:
@@ -768,6 +764,15 @@ if __name__ == "__main__":
         empty_root = ET.Element('tv')
         save_gzipped_xml(ET.ElementTree(empty_root), os.path.join(OUTPUT_DIR, EPG_FILENAME))
         sys.exit(0)
+
+    vod_style = [c for c in final_channel_list_with_streams if '/content/' in (c.get('stream_url') or '')]
+    logging.info(f"{len(vod_style)} VOD-style channels detected (mode={VOD_STYLE_MODE}).")
+    if VOD_STYLE_MODE == "drop":
+        vod_ids = {c['id'] for c in vod_style}
+        final_channel_list_with_streams = [c for c in final_channel_list_with_streams if c['id'] not in vod_ids]
+    elif VOD_STYLE_MODE == "tag":
+        for c in vod_style:
+            c['group'] = VOD_GROUP_TITLE
 
     logging.info(f"Proceeding with {len(final_channel_list_with_streams)} channels with stream URLs.")
 
