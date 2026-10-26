@@ -47,7 +47,7 @@ XUMO_LOGO_URL_TEMPLATE = "https://image.xumo.com/v1/channels/channel/{channel_id
 # (live-content.xumo.com/<provider>/content/<assetId>/...), not a live stream. Players start
 # these at the beginning of the file and the URL goes stale when the program changes.
 # "keep" = leave as-is | "tag" = move to group VOD_GROUP_TITLE | "drop" = remove from M3U and EPG
-VOD_STYLE_MODE = "drop"
+VOD_STYLE_MODE = "tag"
 VOD_GROUP_TITLE = "VOD-style (starts at beginning)"
 
 # --- Script Settings ---
@@ -312,6 +312,17 @@ def get_channels_via_primary_list():
 
 # --- Stream URLs ---
 
+def _asset_window(asset):
+    """Return (start, end) datetimes for a broadcast.json asset.
+    The API gives unix seconds under asset['timestamps'] (not ISO 'start'/'end' strings)."""
+    ts = asset.get('timestamps')
+    if isinstance(ts, dict):
+        s, e = ts.get('start'), ts.get('end')
+        if isinstance(s, (int, float)) and isinstance(e, (int, float)):
+            return datetime.fromtimestamp(s, timezone.utc), datetime.fromtimestamp(e, timezone.utc)
+    return parse_iso_datetime(asset.get('start')), parse_iso_datetime(asset.get('end'))
+
+
 def fetch_stream_urls_via_asset_lookup(channels_list):
     logging.info(f"Attempting Android TV asset lookup for {len(channels_list)} channels...")
     processed_count = 0
@@ -329,12 +340,12 @@ def fetch_stream_urls_via_asset_lookup(channels_list):
             now_utc = datetime.now(timezone.utc)
             current_asset = None
             for asset in broadcast_data['assets']:
-                start_time = parse_iso_datetime(asset.get('start'))
-                end_time = parse_iso_datetime(asset.get('end'))
+                start_time, end_time = _asset_window(asset)
                 if start_time and end_time and start_time <= now_utc < end_time:
                     current_asset = asset
                     break
             if not current_asset:
+                logging.warning(f"No airing asset found for channel {channel_id}; using first asset in hour block.")
                 current_asset = broadcast_data['assets'][0]
             asset_id = current_asset.get('id')
 
